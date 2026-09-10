@@ -143,26 +143,13 @@ class LocalParquetStore:
                     updated_at TEXT NOT NULL
                 )
             """)
-            connection.execute("""
-                CREATE TABLE IF NOT EXISTS domain_shards (
-                    domain TEXT PRIMARY KEY,
-                    next_part INTEGER NOT NULL
-                )
-            """)
             connection.commit()
 
     def store_records(self, records: Iterable[DDCRecord]) -> StoreResult:
-        """Persist one ingestion batch without committing dedupe metadata early.
-
-        New Parquet files are prepared under a transaction-specific staging
-        directory. They are moved into the live dataset only after every
-        domain file has been written successfully. SQLite dedupe metadata is
-        committed last. Any ordinary exception before commit removes all new
-        Parquet files and rolls the SQLite transaction back, so retrying the
-        same records cannot turn missing data into permanent duplicates.
-        """
+        """Persist one ingestion batch without committing dedupe metadata early."""
         with self.lock:
             accepted_records: list[DDCRecord] = []
+            pending_urls: set[str] = set()
             duplicate_updates: list[tuple[str, str, str]] = []
             duplicates = 0
             rejected = 0
@@ -188,6 +175,11 @@ class LocalParquetStore:
                         "discovered_at": batch_discovered_at,
                     })
                     discovered = batch_discovered_at.isoformat()
+
+                    if normalized.url in pending_urls:
+                        duplicates += 1
+                        continue
+
                     existing = connection.execute(
                         "SELECT 1 FROM urls WHERE url = ?",
                         (normalized.url,),
@@ -196,6 +188,8 @@ class LocalParquetStore:
                         duplicates += 1
                         duplicate_updates.append((normalized.title, discovered, normalized.url))
                         continue
+
+                    pending_urls.add(normalized.url)
                     accepted_records.append(normalized)
 
                 shard_files, installed_files = self._write_parquet_transactional(accepted_records)
@@ -241,12 +235,7 @@ class LocalParquetStore:
             )
 
     def _write_parquet_transactional(self, records: List[DDCRecord]) -> tuple[List[str], List[Path]]:
-        """Prepare all new shards first, then install them as immutable files.
-
-        A fresh file is created per domain for this ingestion batch. Avoiding
-        in-place merges means rollback can safely remove only files created by
-        the current transaction without restoring older dataset content.
-        """
+        """Prepare all new shards first, then install them as immutable files."""
         if not records:
             return [], []
 
@@ -289,7 +278,6 @@ class LocalParquetStore:
         )
 
     def _write_parquet(self, records: List[DDCRecord]) -> List[str]:
-        """Compatibility wrapper used by tests and local callers."""
         shard_files, _ = self._write_parquet_transactional(records)
         return shard_files
 
@@ -309,13 +297,6 @@ class LocalParquetStore:
             )
 
     def acquire_sync_batch(self) -> SyncBatch | None:
-        """Return an immutable directory for one upload attempt.
-
-        Failed batches remain staged and are retried before live data. When no
-        staged batch exists, all currently completed Parquet files are moved
-        under the same lock used by writers. New writes therefore land in a
-        fresh live dataset and can never be deleted with the in-flight batch.
-        """
         with self.lock:
             staged = self._staged_batch_dirs()
             if staged:
@@ -337,14 +318,12 @@ class LocalParquetStore:
             return SyncBatch(batch_dir, from_live_dataset=True)
 
     def complete_sync_batch(self, batch: Path) -> int:
-        """Delete only the immutable batch that was confirmed uploaded."""
         with self.lock:
             count = sum(1 for _ in batch.rglob("*.parquet")) if batch.exists() else 0
             shutil.rmtree(batch, ignore_errors=True)
             return count
 
     def restore_sync_batch(self, batch: Path) -> int:
-        """Move an uploaded batch back to live storage when deletion is disabled."""
         with self.lock:
             if not batch.exists():
                 return 0
