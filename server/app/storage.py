@@ -118,11 +118,16 @@ class LocalParquetStore:
         self.settings.resolved_data_dir.mkdir(parents=True, exist_ok=True)
         self.settings.dataset_dir.mkdir(parents=True, exist_ok=True)
         self.sync_staging_dir.mkdir(parents=True, exist_ok=True)
+        self.write_staging_dir.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
     @property
     def sync_staging_dir(self) -> Path:
         return self.settings.resolved_data_dir / "sync-staging"
+
+    @property
+    def write_staging_dir(self) -> Path:
+        return self.settings.resolved_data_dir / "write-staging"
 
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(self.settings.metadata_db_path)
@@ -147,12 +152,26 @@ class LocalParquetStore:
             connection.commit()
 
     def store_records(self, records: Iterable[DDCRecord]) -> StoreResult:
+        """Persist one ingestion batch without committing dedupe metadata early.
+
+        New Parquet files are prepared under a transaction-specific staging
+        directory. They are moved into the live dataset only after every
+        domain file has been written successfully. SQLite dedupe metadata is
+        committed last. Any ordinary exception before commit removes all new
+        Parquet files and rolls the SQLite transaction back, so retrying the
+        same records cannot turn missing data into permanent duplicates.
+        """
         with self.lock:
-            accepted_records = []
+            accepted_records: list[DDCRecord] = []
+            duplicate_updates: list[tuple[str, str, str]] = []
             duplicates = 0
             rejected = 0
+            installed_files: list[Path] = []
             batch_discovered_at = datetime.now(timezone.utc)
-            with self._connect() as connection:
+
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
                 for record in records:
                     try:
                         domain, cleaned_url = clean_url(record.url)
@@ -162,29 +181,57 @@ class LocalParquetStore:
                     if record.source == "page" and is_private_page_domain(domain):
                         rejected += 1
                         continue
+
                     normalized = record.model_copy(update={
                         "domain": domain,
                         "url": cleaned_url,
                         "discovered_at": batch_discovered_at,
                     })
                     discovered = batch_discovered_at.isoformat()
-                    cursor = connection.execute("""
-                        INSERT OR IGNORE INTO urls (url, domain, title, discovered_at, updated_at)
-                        VALUES (?, ?, ?, ?, ?)
-                    """, (normalized.url, normalized.domain, normalized.title, discovered, discovered))
-                    if cursor.rowcount == 0:
+                    existing = connection.execute(
+                        "SELECT 1 FROM urls WHERE url = ?",
+                        (normalized.url,),
+                    ).fetchone()
+                    if existing is not None:
                         duplicates += 1
-                        connection.execute("""
-                            UPDATE urls
-                            SET title = COALESCE(NULLIF(?, ''), title),
-                                discovered_at = MAX(discovered_at, ?),
-                                updated_at = ?
-                            WHERE url = ?
-                        """, (normalized.title, discovered, discovered, normalized.url))
+                        duplicate_updates.append((normalized.title, discovered, normalized.url))
                         continue
                     accepted_records.append(normalized)
+
+                shard_files, installed_files = self._write_parquet_transactional(accepted_records)
+
+                for normalized in accepted_records:
+                    discovered = normalized.discovered_at.isoformat()
+                    connection.execute("""
+                        INSERT INTO urls (url, domain, title, discovered_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?)
+                    """, (
+                        normalized.url,
+                        normalized.domain,
+                        normalized.title,
+                        discovered,
+                        discovered,
+                    ))
+
+                for title, discovered, url in duplicate_updates:
+                    connection.execute("""
+                        UPDATE urls
+                        SET title = COALESCE(NULLIF(?, ''), title),
+                            discovered_at = MAX(discovered_at, ?),
+                            updated_at = ?
+                        WHERE url = ?
+                    """, (title, discovered, discovered, url))
+
                 connection.commit()
-            shard_files = self._write_parquet(accepted_records)
+            except Exception:
+                connection.rollback()
+                for path in installed_files:
+                    path.unlink(missing_ok=True)
+                self._remove_empty_directories(self.settings.dataset_dir)
+                raise
+            finally:
+                connection.close()
+
             return StoreResult(
                 accepted=len(accepted_records),
                 duplicates=duplicates,
@@ -193,18 +240,58 @@ class LocalParquetStore:
                 shard_files=shard_files,
             )
 
-    def _write_parquet(self, records: List[DDCRecord]) -> List[str]:
+    def _write_parquet_transactional(self, records: List[DDCRecord]) -> tuple[List[str], List[Path]]:
+        """Prepare all new shards first, then install them as immutable files.
+
+        A fresh file is created per domain for this ingestion batch. Avoiding
+        in-place merges means rollback can safely remove only files created by
+        the current transaction without restoring older dataset content.
+        """
         if not records:
-            return []
-        written_files = []
+            return [], []
+
+        transaction_id = uuid.uuid4().hex
+        transaction_dir = self.write_staging_dir / f"txn-{transaction_id}"
+        prepared: list[tuple[Path, Path]] = []
+        installed: list[Path] = []
         by_domain: dict[str, list[DDCRecord]] = defaultdict(list)
         for record in records:
             by_domain[record.domain].append(record)
-        for domain, domain_records in by_domain.items():
-            table = self._records_to_table(domain_records)
-            shard_path = self._write_domain_table(domain, table)
-            written_files.append(str(shard_path.relative_to(self.settings.dataset_dir)))
-        return written_files
+
+        try:
+            for domain, domain_records in by_domain.items():
+                table = self._records_to_table(domain_records)
+                domain_key = safe_domain_path(domain)
+                staged_dir = transaction_dir / f"domain_key={domain_key}"
+                staged_dir.mkdir(parents=True, exist_ok=True)
+                staged_path = staged_dir / f"part-{transaction_id}.parquet"
+                pq.write_table(table, staged_path, compression="zstd")
+
+                target_dir = self.settings.dataset_dir / f"domain_key={domain_key}"
+                target_path = target_dir / f"part-{transaction_id}.parquet"
+                prepared.append((staged_path, target_path))
+
+            for staged_path, target_path in prepared:
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(staged_path, target_path)
+                installed.append(target_path)
+        except Exception:
+            for target_path in installed:
+                target_path.unlink(missing_ok=True)
+            raise
+        finally:
+            shutil.rmtree(transaction_dir, ignore_errors=True)
+            self._remove_empty_directories(self.write_staging_dir)
+
+        return (
+            [str(path.relative_to(self.settings.dataset_dir)) for path in installed],
+            installed,
+        )
+
+    def _write_parquet(self, records: List[DDCRecord]) -> List[str]:
+        """Compatibility wrapper used by tests and local callers."""
+        shard_files, _ = self._write_parquet_transactional(records)
+        return shard_files
 
     def _records_to_table(self, records: List[DDCRecord]) -> pa.Table:
         return pa.Table.from_arrays([
@@ -214,45 +301,6 @@ class LocalParquetStore:
             pa.array([record.discovered_at.astimezone(timezone.utc) for record in records], type=pa.timestamp("us", tz="UTC")),
             pa.array([record.keywords for record in records], type=pa.list_(pa.string())),
         ], schema=SCHEMA)
-
-    def _write_domain_table(self, domain: str, table: pa.Table) -> Path:
-        domain_dir = self.settings.dataset_dir / f"domain_key={safe_domain_path(domain)}"
-        domain_dir.mkdir(parents=True, exist_ok=True)
-        temp_path = domain_dir / f".incoming-{os.getpid()}-{threading.get_ident()}.parquet"
-        pq.write_table(table, temp_path, compression="zstd")
-        target_path = self._select_shard_path(domain, domain_dir, temp_path.stat().st_size)
-        if target_path.exists() and target_path.stat().st_size + temp_path.stat().st_size <= self.settings.max_shard_bytes:
-            existing = pq.read_table(target_path, schema=SCHEMA)
-            merged = pa.concat_tables([existing, table], promote_options="default")
-            merged_path = target_path.with_suffix(".parquet.tmp")
-            pq.write_table(merged, merged_path, compression="zstd")
-            os.replace(merged_path, target_path)
-            temp_path.unlink(missing_ok=True)
-        else:
-            os.replace(temp_path, target_path)
-        return target_path
-
-    def _select_shard_path(self, domain: str, domain_dir: Path, incoming_size: int) -> Path:
-        parts = sorted(domain_dir.glob("part-*.parquet"))
-        latest = parts[-1] if parts else None
-        if latest and latest.stat().st_size + incoming_size <= self.settings.max_shard_bytes:
-            return latest
-        return self._allocate_shard_path(domain, domain_dir, parts)
-
-    def _allocate_shard_path(self, domain: str, domain_dir: Path, parts: List[Path]) -> Path:
-        max_existing_part = -1
-        for path in parts:
-            try:
-                max_existing_part = max(max_existing_part, int(path.stem.split("-")[-1]))
-            except ValueError:
-                continue
-        with self._connect() as connection:
-            connection.execute("INSERT OR IGNORE INTO domain_shards (domain, next_part) VALUES (?, ?)", (domain, max_existing_part + 1))
-            row = connection.execute("SELECT next_part FROM domain_shards WHERE domain = ?", (domain,)).fetchone()
-            next_part = max(int(row[0]), max_existing_part + 1)
-            connection.execute("UPDATE domain_shards SET next_part = ? WHERE domain = ?", (next_part + 1, domain))
-            connection.commit()
-        return domain_dir / f"part-{next_part:06d}.parquet"
 
     def has_pending_dataset_files(self) -> bool:
         with self.lock:
