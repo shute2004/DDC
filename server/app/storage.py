@@ -1,8 +1,10 @@
 import ipaddress
 import os
 import re
+import shutil
 import sqlite3
 import threading
+import uuid
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -38,6 +40,7 @@ SCHEMA = pa.schema([
     pa.field("keywords", pa.list_(pa.string()), nullable=False),
 ])
 
+
 @dataclass
 class StoreResult:
     accepted: int
@@ -46,9 +49,17 @@ class StoreResult:
     stored: int
     shard_files: List[str]
 
+
+@dataclass(frozen=True)
+class SyncBatch:
+    path: Path
+    from_live_dataset: bool
+
+
 def is_tracking_param(name: str) -> bool:
     normalized = name.strip().lower()
     return normalized.startswith("utm_") or normalized in TRACKING_PARAMS
+
 
 def is_local_or_private_hostname(hostname: str) -> bool:
     normalized = hostname.strip("[]").lower().rstrip(".")
@@ -69,9 +80,11 @@ def is_local_or_private_hostname(hostname: str) -> bool:
         address.is_unspecified,
     ])
 
+
 def is_private_page_domain(hostname: str) -> bool:
     normalized = hostname.lower().rstrip(".")
     return any(normalized == domain or normalized.endswith(f".{domain}") for domain in PRIVATE_PAGE_DOMAINS)
+
 
 def clean_url(raw_url: str) -> tuple[str, str]:
     parsed = urlsplit(raw_url.strip())
@@ -93,8 +106,10 @@ def clean_url(raw_url: str) -> tuple[str, str]:
     path = re.sub(r"/{2,}", "/", parsed.path or "/")
     return hostname, urlunsplit((parsed.scheme.lower(), netloc, path, query, ""))
 
+
 def safe_domain_path(domain: str) -> str:
     return re.sub(r"[^a-z0-9.-]+", "_", domain.lower()).strip("._") or "unknown"
+
 
 class LocalParquetStore:
     def __init__(self, settings: Settings):
@@ -102,7 +117,12 @@ class LocalParquetStore:
         self.lock = threading.Lock()
         self.settings.resolved_data_dir.mkdir(parents=True, exist_ok=True)
         self.settings.dataset_dir.mkdir(parents=True, exist_ok=True)
+        self.sync_staging_dir.mkdir(parents=True, exist_ok=True)
         self._init_db()
+
+    @property
+    def sync_staging_dir(self) -> Path:
+        return self.settings.resolved_data_dir / "sync-staging"
 
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(self.settings.metadata_db_path)
@@ -235,18 +255,81 @@ class LocalParquetStore:
         return domain_dir / f"part-{next_part:06d}.parquet"
 
     def has_pending_dataset_files(self) -> bool:
-        return self.settings.dataset_dir.exists() and any(self.settings.dataset_dir.rglob("*.parquet"))
+        with self.lock:
+            return self._has_parquet(self.settings.dataset_dir) or any(
+                self._has_parquet(path) for path in self._staged_batch_dirs()
+            )
 
-    def clear_dataset_files(self) -> int:
-        deleted = 0
-        if not self.settings.dataset_dir.exists():
-            return deleted
-        for path in sorted(self.settings.dataset_dir.rglob("*.parquet")):
-            path.unlink(missing_ok=True)
-            deleted += 1
-        for directory in sorted((path for path in self.settings.dataset_dir.rglob("*") if path.is_dir()), reverse=True):
+    def acquire_sync_batch(self) -> SyncBatch | None:
+        """Return an immutable directory for one upload attempt.
+
+        Failed batches remain staged and are retried before live data. When no
+        staged batch exists, all currently completed Parquet files are moved
+        under the same lock used by writers. New writes therefore land in a
+        fresh live dataset and can never be deleted with the in-flight batch.
+        """
+        with self.lock:
+            staged = self._staged_batch_dirs()
+            if staged:
+                return SyncBatch(staged[0], from_live_dataset=False)
+
+            parquet_files = sorted(self.settings.dataset_dir.rglob("*.parquet"))
+            if not parquet_files:
+                return None
+
+            batch_dir = self.sync_staging_dir / f"batch-{uuid.uuid4().hex}"
+            for source in parquet_files:
+                relative = source.relative_to(self.settings.dataset_dir)
+                target = batch_dir / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(source, target)
+
+            self._remove_empty_directories(self.settings.dataset_dir)
+            self.settings.dataset_dir.mkdir(parents=True, exist_ok=True)
+            return SyncBatch(batch_dir, from_live_dataset=True)
+
+    def complete_sync_batch(self, batch: Path) -> int:
+        """Delete only the immutable batch that was confirmed uploaded."""
+        with self.lock:
+            count = sum(1 for _ in batch.rglob("*.parquet")) if batch.exists() else 0
+            shutil.rmtree(batch, ignore_errors=True)
+            return count
+
+    def restore_sync_batch(self, batch: Path) -> int:
+        """Move an uploaded batch back to live storage when deletion is disabled."""
+        with self.lock:
+            if not batch.exists():
+                return 0
+            moved = 0
+            for source in sorted(batch.rglob("*.parquet")):
+                relative = source.relative_to(batch)
+                target = self.settings.dataset_dir / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if target.exists():
+                    raise RuntimeError(f"sync batch restore collision: {relative}")
+                os.replace(source, target)
+                moved += 1
+            shutil.rmtree(batch, ignore_errors=True)
+            return moved
+
+    def _staged_batch_dirs(self) -> list[Path]:
+        if not self.sync_staging_dir.exists():
+            return []
+        return sorted(
+            (path for path in self.sync_staging_dir.iterdir() if path.is_dir() and self._has_parquet(path)),
+            key=lambda path: path.name,
+        )
+
+    @staticmethod
+    def _has_parquet(directory: Path) -> bool:
+        return directory.exists() and any(directory.rglob("*.parquet"))
+
+    @staticmethod
+    def _remove_empty_directories(root: Path) -> None:
+        if not root.exists():
+            return
+        for directory in sorted((path for path in root.rglob("*") if path.is_dir()), reverse=True):
             try:
                 directory.rmdir()
             except OSError:
                 pass
-        return deleted
