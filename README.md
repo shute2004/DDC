@@ -11,8 +11,9 @@ The current implementation consists of two parts:
 
 ```text
 extension/        Chromium MV3 collector
-server/           FastAPI relay and storage backend
-tests/            lightweight tests for shared normalization logic
+server/           FastAPI relay, SQLite metadata, Parquet storage, HF sync
+tests/            browser-side normalization/keyword tests
+server/tests/     storage and synchronization invariant tests
 ```
 
 ## Setup
@@ -27,6 +28,8 @@ uvicorn server.app.main:app --host 127.0.0.1 --port 8787 --reload
 
 Load `extension/` as an unpacked extension from `chrome://extensions` with developer mode enabled. The default relay endpoint is `http://127.0.0.1:8787/ingest`.
 
+**The relay is designed for loopback/local use.** The administrative Hugging Face sync endpoint is intentionally not an Internet-facing authenticated control plane. Do not bind this development relay to a public interface without adding an authentication and deployment boundary appropriate for that environment.
+
 ## Hugging Face synchronization
 
 Set the following values in `.env` to enable server-side synchronization:
@@ -38,6 +41,8 @@ HF_TOKEN=<your-hugging-face-token>
 ```
 
 The token is never stored in the browser extension.
+
+Before a network upload starts, completed Parquet files are moved under the same storage lock into an immutable `sync-staging/` batch. New records arriving while that batch is uploading remain in the live dataset and are not part of its post-upload cleanup. Failed staged batches are retained for retry.
 
 ## Privacy and collection constraints
 
@@ -66,8 +71,11 @@ The token is never stored in the browser extension.
 
 ```bash
 npm test
+.venv/bin/python -m unittest discover -s server/tests
 .venv/bin/python -m compileall server
 ```
+
+The Python tests cover URL deduplication, Parquet output, private-page rejection, staged retry behavior, and the regression case where a new record arrives while an older immutable batch is being uploaded.
 
 ## License
 
