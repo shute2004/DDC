@@ -48,6 +48,23 @@ class StorageFailureAtomicityTests(unittest.TestCase):
             self.assertEqual(duplicate_retry.stored, 0)
             self.assertEqual(duplicate_retry.duplicates, 2)
 
+    def test_same_batch_duplicate_is_stored_once(self):
+        with tempfile.TemporaryDirectory() as temp:
+            settings = make_settings(Path(temp))
+            store = LocalParquetStore(settings)
+
+            result = store.store_records([
+                record("https://example.com/page?utm_source=a&id=1"),
+                record("https://example.com/page?id=1"),
+            ])
+
+            self.assertEqual(result.stored, 1)
+            self.assertEqual(result.duplicates, 1)
+            with sqlite3.connect(settings.metadata_db_path) as connection:
+                count = connection.execute("SELECT COUNT(*) FROM urls").fetchone()[0]
+            self.assertEqual(count, 1)
+            self.assertEqual(len(list(settings.dataset_dir.rglob("*.parquet"))), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
