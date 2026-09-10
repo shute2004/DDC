@@ -62,25 +62,48 @@ class AutoSyncManager:
                 "huggingface_repo_configured": bool(self.settings.hf_repo_id),
                 "huggingface_token_configured": bool(self.settings.hf_token),
             }
+
         with self._condition:
             if self._syncing:
                 return {"skipped": "already_syncing"}
             self._syncing = True
+
         try:
             if not self.store.has_pending_dataset_files():
                 result: dict[str, Any] = {"skipped": "no_local_parquet_files"}
             elif not force and not self._interval_elapsed() and self._pending_records < self.settings.auto_sync_min_records:
                 result = {"skipped": "waiting_for_interval_or_record_threshold"}
             else:
-                result = sync_to_huggingface(self.settings)
-                if result.get("uploaded_files", 0) > 0 and self.settings.delete_local_after_sync:
-                    result["deleted_local_files"] = self.store.clear_dataset_files()
-                self._pending_records = 0
-                self._last_sync_at = datetime.now(timezone.utc)
+                with self._condition:
+                    pending_at_batch_start = self._pending_records
+
+                batch = self.store.acquire_sync_batch()
+                if batch is None:
+                    result = {"skipped": "no_local_parquet_files"}
+                else:
+                    result = sync_to_huggingface(self.settings, dataset_dir=batch.path)
+                    if result.get("uploaded_files", 0) > 0:
+                        if self.settings.delete_local_after_sync:
+                            result["deleted_staged_files"] = self.store.complete_sync_batch(batch.path)
+                        else:
+                            result["restored_local_files"] = self.store.restore_sync_batch(batch.path)
+
+                        # Only records that were moved out of the live dataset
+                        # at the beginning of this upload are acknowledged.
+                        # Records arriving while the network upload is running
+                        # remain pending for the next batch.
+                        if batch.from_live_dataset:
+                            with self._condition:
+                                self._pending_records = max(0, self._pending_records - pending_at_batch_start)
+
+                        self._last_sync_at = datetime.now(timezone.utc)
+
             self._last_result = result
             self._last_error = None
             return result
         except Exception as error:
+            # acquire_sync_batch intentionally leaves a failed batch in
+            # sync-staging so the next attempt retries the exact same files.
             self._last_error = str(error)
             raise
         finally:
