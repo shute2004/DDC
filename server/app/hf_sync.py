@@ -1,22 +1,25 @@
 from datetime import datetime, timezone
+from pathlib import Path
 
 from huggingface_hub import HfApi
 
 from .config import Settings, get_settings
 
 
-def sync_to_huggingface(settings: Settings | None = None) -> dict:
+def sync_to_huggingface(settings: Settings | None = None, dataset_dir: Path | None = None) -> dict:
     resolved = settings or get_settings()
+    source_dir = dataset_dir or resolved.dataset_dir
+
     if not resolved.enable_hf_sync:
         raise RuntimeError("Hugging Face sync is disabled. Set DDC_ENABLE_HF_SYNC=true to enable it.")
     if not resolved.hf_token:
         raise RuntimeError("HF_TOKEN is not set.")
     if not resolved.hf_repo_id:
         raise RuntimeError("DDC_HF_REPO_ID is not set.")
-    if not resolved.dataset_dir.exists():
-        raise RuntimeError(f"Dataset directory does not exist: {resolved.dataset_dir}")
+    if not source_dir.exists():
+        raise RuntimeError(f"Dataset directory does not exist: {source_dir}")
 
-    parquet_files = sorted(resolved.dataset_dir.rglob("*.parquet"))
+    parquet_files = sorted(source_dir.rglob("*.parquet"))
     if not parquet_files:
         return {
             "repo_id": resolved.hf_repo_id,
@@ -31,7 +34,7 @@ def sync_to_huggingface(settings: Settings | None = None) -> dict:
     api.upload_folder(
         repo_id=resolved.hf_repo_id,
         repo_type=resolved.hf_repo_type,
-        folder_path=str(resolved.dataset_dir),
+        folder_path=str(source_dir),
         path_in_repo=resolved.hf_path_in_repo,
         commit_message=commit_message,
     )
