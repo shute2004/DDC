@@ -1,0 +1,30 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# DDC runtime data
+data/
+server/data/
+server_backend/data/
+*.sqlite3
+*.sqlite3-*
+
+# Browser extension packaging artifacts
+*.crx
+*.pem
+dist/
+build/

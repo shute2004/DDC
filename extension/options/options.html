@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>DDC Collector</title>
+    <link rel="stylesheet" href="options.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>DDC Collector</h1>
+        <p id="status">状態を読み込み中...</p>
+      </header>
+
+      <label class="toggle">
+        <input id="enabled" type="checkbox" />
+        <span>収集を有効にする</span>
+      </label>
+
+      <label>
+        <span>中継APIエンドポイント</span>
+        <input id="endpoint" type="url" spellcheck="false" />
+      </label>
+
+      <div class="actions">
+        <button id="save" type="button">保存</button>
+        <button id="flush" type="button">今すぐ送信</button>
+      </div>
+
+      <p id="message" role="status"></p>
+    </main>
+
+    <script src="options.js"></script>
+  </body>
+</html>

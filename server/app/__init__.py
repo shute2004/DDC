@@ -1,0 +1,1 @@
+"""DDC FastAPI application package."""

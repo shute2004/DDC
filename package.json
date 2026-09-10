@@ -1,0 +1,10 @@
+{
+  "name": "ddc",
+  "version": "0.1.0",
+  "private": true,
+  "license": "UNLICENSED",
+  "description": "Distributed Datasets in Cyberspace local collector and relay.",
+  "scripts": {
+    "test": "node --test tests/*.test.mjs"
+  }
+}
